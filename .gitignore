@@ -1,0 +1,12 @@
+data/
+work/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.ipynb_checkpoints/
+*.part
+*.log
