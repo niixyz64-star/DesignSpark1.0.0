@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 from urllib.robotparser import RobotFileParser
 
+from archive_store import RECENT_YEARS, read_card, write_card, valid_image, rebuild_index, resolve_folder
 import requests
 from bs4 import BeautifulSoup
 
@@ -112,12 +113,31 @@ STAGE_PATHS = {'/12/177/', '/12/173/', '/12/175/'}
 
 
 def run(args):
+    destination = Path(args.output).resolve() / 'RedDot-Design Concept' / '_index' / ('task-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f') + '.json')
+    report = {'state':'running', 'complete':False, 'year':args.year, 'years':args.years,
+              'category':args.category, 'award':args.award, 'limit':args.limit}
+    save(destination, report)
+    try:
+        result = _run(args)
+        report.update(state='finished', complete=not bool(args.limit), limited=bool(args.limit))
+        return result
+    except BaseException as exc:
+        report.update(state='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed',error=str(exc))
+        raise
+    finally:
+        save(destination, report)
+
+
+def _run(args):
     years = list(dict.fromkeys(args.years or [args.year]))
+    if any(year not in RECENT_YEARS for year in years):
+        raise ValueError(f'Supported years: {RECENT_YEARS}')
     client = Client(args.delay)
     failures = []
     for year in years:
         child = argparse.Namespace(**vars(args))
         child.year = year
+        child.progress = {'seen': set(), 'count': 0}
         print(f'Year: {year}', flush=True)
         try:
             run_year(child, client)
@@ -128,22 +148,68 @@ def run(args):
         raise SystemExit('\n'.join(failures))
 
 
+def resolve_category_name(concept, name):
+    """Resolve only against the current response, never a local catalogue."""
+    def normalized(value):
+        return re.sub(r'[^a-z0-9]+', '', value.casefold())
+    nodes=[]
+    def walk(node):
+        if node.get('value') in STAGE_PATHS: return
+        if node.get('value') != '/12/': nodes.append(node)
+        for child in node.get('children', []): walk(child)
+    walk(concept)
+    exact=[node for node in nodes if node['label'].strip().casefold()==name.strip().casefold()]
+    matches=exact or [node for node in nodes if normalized(node['label'])==normalized(name)]
+    paths={node['value']:node for node in matches}
+    if len(paths)!=1:
+        labels='; '.join(f"{n['label']} ({n['value']})" for n in (matches or nodes))
+        raise ValueError(f'Category name unavailable or ambiguous: {name}. Live official categories: {labels}')
+    return next(iter(paths.values()))
+
+
+def export_category_index(out, concept, year):
+    categories = [c for c in concept.get('children', []) if c['value'] not in STAGE_PATHS]
+    rows = []
+    def walk(node, parent=None):
+        rows.append({'name':node['label'], 'path':node['value'], 'parent':parent,
+                     'count':node.get('count',0)})
+        for child in node.get('children',[]): walk(child,node['label'])
+    for category in categories: walk(category)
+    save(out / '_index' / 'categories.json', {'year':year,'topic_count':len(categories),
+         'source':'live official search facets','categories':rows})
+    table = '# Red Dot Design Concept categories\n\n'
+    table += f'Year: {year}; topic categories: {len(categories)}\n\n'
+    table += '| Category | Official path | Parent | Works |\n|---|---|---|---|\n'
+    for row in rows:
+        name = row['name'].replace('|',' / ')
+        table += f"| {name} | {row['path']} | {row['parent'] or '-'} | {row['count']} |\n"
+    (out / '_index' / 'categories.md').write_text(table,encoding='utf-8')
+    return categories
+
+
 def run_year(args, client):
+    # Always load the complete live directory before resolving a selected topic.
+    payload = client.search(args.year, '/12/')
+    facet = next(f for f in payload['facets'] if f['field']=='meta_categories')
+    concept = next(c for c in facet['children'] if c['value']=='/12/')
+    out = Path(args.output).resolve() / 'RedDot-Design Concept' / str(args.year)
+    categories = export_category_index(out,concept,args.year)
+    if not args.category.startswith('/'):
+        match = resolve_category_name(concept,args.category)
+        print(f"Live official category: {match['label']} -> {match['value']}",flush=True)
+        args.category = match['value']
+    if args.command == 'categories':
+        for row in categories: print(f"{row['value']}  {row['label']} ({row.get('count',0)})")
+        print(f'Topic categories: {len(categories)}')
+        return
     if args.category != '/12/':
         return run_category(args, client)
-    payload = client.search(args.year, '/12/')
-    facet = next(f for f in payload['facets'] if f['field'] == 'meta_categories')
-    concept = next(c for c in facet['children'] if c['value'] == '/12/')
-    out = Path(args.output).resolve() / str(args.year) / 'Concept Design'
     save(out / 'categories.json', concept)
-    # 官网将三个项目阶段与主题分类并列，阶段不建立大类目录。
-    categories = [c for c in concept.get('children', []) if c['value'] not in STAGE_PATHS]
-    save(out / 'category_manifest.json', {'year': args.year, 'count': len(categories),
-                                         'categories': categories,
-                                         'stage_filters': [c for c in concept.get('children', []) if c['value'] in STAGE_PATHS]})
     print(f'Design Concept: {len(categories)} topic categories')
     failures = []
     for category in categories:
+        if args.limit and args.progress['count'] >= args.limit:
+            break
         print(f"Category: {category['label']} ({category['count']})")
         (out / safe_name(category['label'])).mkdir(parents=True, exist_ok=True)
         if args.command == 'categories' or not category['count']:
@@ -163,13 +229,18 @@ def run_year(args, client):
 
 
 def run_category(args, client=None):
-    out = Path(args.output).resolve() / str(args.year) / 'Concept Design'
+    out = Path(args.output).resolve() / 'RedDot-Design Concept' / str(args.year)
     client = client or Client(args.delay)
     initial = client.search(args.year, args.category)
     categories = next(f for f in initial['facets'] if f['field'] == 'meta_categories')
     concept = next(c for c in categories['children'] if c['value'] == '/12/')
-    parent_category = next((c['label'] for c in concept.get('children', [])
-                            if c['value'] == args.category), concept['label'])
+    def containing(node, value):
+        if node['value'] == value: return True
+        return any(containing(c, value) for c in node.get('children', []))
+    topic = next((c for c in concept.get('children', []) if containing(c,args.category)), None)
+    if topic is None:
+        raise ValueError('Unknown topic category; use categories to inspect official paths')
+    parent_category = topic['label']
     archive_root = out / safe_name(parent_category)
     save(out / 'categories.json', concept)
     if args.command == 'categories':
@@ -203,35 +274,50 @@ def run_category(args, client=None):
         print(f'Detail category: {args.detail_category}; matched {len(docs)} works')
         if not docs:
             raise RuntimeError('No exact detail-category matches; check the category label')
+    if args.award:
+        docs = {url: doc for url, doc in docs.items() if doc.get('data', {}).get('award', '').casefold() == args.award.casefold()}
     if args.command == 'discover':
+        print(f'Matching works: {len(docs)}')
         return
     errors = []
     processed = 0
     for url, doc in docs.items():
-        if args.limit and processed >= args.limit:
+        if args.limit and args.progress['count'] >= args.limit:
             break
+        if url in args.progress['seen']: continue
+        args.progress['seen'].add(url)
+        args.progress['count'] += 1
         processed += 1
         slug = url.rstrip('/').split('/')[-1]
         detail_category = doc.get('data', {}).get('category', '').split('|', 1)[0].strip() or 'Uncategorized'
-        folder = archive_root / safe_name(detail_category) / slug
-        metadata = folder / 'metadata.json'
-        if metadata.exists() and not args.refresh and json.loads(metadata.read_text(encoding='utf-8')).get('images') and all(i.get('local_path') and (folder / i['local_path']).exists() for i in json.loads(metadata.read_text(encoding='utf-8'))['images']):
-            old = json.loads(metadata.read_text(encoding='utf-8'))
-            old['category_paths'] = sorted(set(old.get('category_paths', []) + [args.category]))
-            save(metadata, old)
-            print('Skip:', slug)
+        award = str(doc.get('data', {}).get('award') or 'unverified')
+        award_suffix = 'RedDot' if re.sub(r'[^a-z]', '', award.casefold()) == 'reddot' else award
+        work_name = doc.get('title', '').strip()
+        if not work_name: raise ValueError('Missing official work name')
+        folder = archive_root / safe_name(detail_category) / safe_name(work_name + '-' + award_suffix)
+        existing = read_card(folder)
+        if existing and str(existing.get('source_id')) != slug.rsplit('-',1)[-1]:
+            raise ValueError(f'Same title and award used by different works: {folder}; no overwrite performed')
+        folder = resolve_folder(out, folder, slug.rsplit('-',1)[-1])
+        old = read_card(folder)
+        if old and not args.refresh and old.get('images') and all(valid_image(folder,i) for i in old['images']):
+            old.update(category_parent=parent_category, category_detail=detail_category, award=award, award_level=award)
+            write_card(folder,old)
+            print('Skip complete:', slug)
             continue
         try:
             html = client.get(url).text
             detail = parse_detail(html)
+            if not detail['image_urls']:
+                raise ValueError('No official project images found')
             if not detail['detail_title']:
                 raise ValueError('Missing detail title; check parser')
             data = doc['data']
             raw_category = data.get('category', '')
             parts = raw_category.split('|', 1)
             paths = [args.category]
-            if metadata.exists():
-                paths += json.loads(metadata.read_text(encoding='utf-8')).get('category_paths', [])
+            if old:
+                paths += old.get('category_paths', [])
             record = dict(detail, source_id=slug.rsplit('-', 1)[-1], title=doc['title'],
                           year=args.year, competition=data['competition'], award=data['award'],
                           category_raw=raw_category, category_detail=parts[0].strip(),
@@ -241,9 +327,15 @@ def run_category(args, client=None):
                           image_license='unverified', fetched_at=datetime.now(timezone.utc).isoformat())
             image_folder = folder / 'image'
             image_folder.mkdir(parents=True, exist_ok=True)
-            record['images'] = []
+            record.update(source='RedDot', award_level=data['award'])
+            record['images'] = [dict(url=u,local_path=None,status='pending') for u in record['image_urls']]
+            write_card(folder, record)
             for i, image_url in enumerate(record['image_urls'], 1):
                 item = {'url': image_url, 'local_path': None, 'status': 'pending'}
+                previous = next((item for item in (old or {}).get('images',[]) if item['url']==image_url and valid_image(folder,item)), None)
+                if previous and not args.refresh:
+                    record['images'][i-1] = previous
+                    continue
                 if not client.robots.can_fetch(client.agent, image_url):
                     item['status'] = 'blocked_by_robots'
                 else:
@@ -260,13 +352,13 @@ def run_category(args, client=None):
                         item.update(local_path=relative, status='downloaded')
                     except (requests.RequestException, ValueError) as exc:
                         item['status'] = 'failed: ' + str(exc)
-                record['images'].append(item)
+                record['images'][i-1] = item
+                write_card(folder, record)
                 if item['status'] != 'downloaded':
                     errors.append({'url': image_url, 'error': item['status']})
-            save(metadata, record)
-            (folder / 'README.md').write_text(render(record), encoding='utf-8')
-            for obsolete in ('notes.md', 'source.html'):
-                (folder / obsolete).unlink(missing_ok=True)
+            write_card(folder, record)
+            if not record['images_complete']:
+                errors.append({'url': url, 'error': 'Missing or invalid images'})
             print('Saved:', slug)
         except RuntimeError:
             raise
@@ -274,20 +366,13 @@ def run_category(args, client=None):
             errors.append({'url': url, 'error': str(exc)})
             print('Failed:', url, exc)
     save(out / 'last_errors.json', errors)
-    records = [dict(json.loads(p.read_text(encoding='utf-8')),
-                    archive_path=p.parent.relative_to(out).as_posix())
-               for p in out.glob('*/*/*/metadata.json')]
-    save(out / 'index.json', records)
-    fields = ['source_id', 'title', 'year', 'award', 'category_parent', 'category_detail', 'project_stage', 'source_url', 'archive_path']
-    try:
-        csv_file = (out / 'index.csv').open('w', encoding='utf-8-sig', newline='')
-    except PermissionError:
-        csv_file = (out / 'index.latest.csv').open('w', encoding='utf-8-sig', newline='')
-        print('index.csv is locked; exported index.latest.csv instead')
-    with csv_file as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(records)
+    records = rebuild_index(out)
+    save(out / '_index' / 'last_run.json', {'year':args.year,'category':args.category,
+        'award':args.award,'available_matches':len(docs),'processed':processed,
+        'limit':args.limit,'errors':errors,'complete':not errors,
+        'scope':'selected scope, possibly limited; not necessarily the full year'})
+    if args.limit and args.progress['count'] < args.limit:
+        print(f"Available so far: {args.progress['count']}/{args.limit}; fewer matches may exist")
     if errors:
         raise SystemExit(f'{len(errors)} failures; see last_errors.json and rerun to retry')
 
@@ -295,9 +380,10 @@ def run_category(args, client=None):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['categories', 'discover', 'fetch'])
-    parser.add_argument('--year', type=int, default=2026)
+    parser.add_argument('--year', type=int, choices=RECENT_YEARS, default=max(RECENT_YEARS))
     parser.add_argument('--years', type=int, nargs='+', help='Multiple years, e.g. --years 2025 2026; overrides --year')
-    parser.add_argument('--category', default='/12/', help='/12/ discovers all topic categories; use /12/13/ for a single category')
+    parser.add_argument('--category', default='/12/', help='Live official category name (e.g. HomeFuture) or category path; /12/ means all topics')
+    parser.add_argument('--award', default='', help='Exact official award label; omitted means all award levels')
     parser.add_argument('--detail-category', default='',
                         help='Exact category before | in official list; pass an empty string to disable')
     parser.add_argument('--output', default=str(ROOT / 'data'))

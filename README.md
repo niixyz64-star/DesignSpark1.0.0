@@ -1,102 +1,70 @@
-# Red Dot Design Concept 爬虫
+# DesignSpark
 
-默认年份 2026，自动发现 Design Concept 全部主题大类，逐类完整分页采集。
+面向设计者的本地案例作品库：定向采集获奖作品、保存图片与知识卡片，通过本地网页分类浏览、检索和阅读。
 
-```powershell
-python -m pip install -r requirements.txt
-python reddot_crawler.py categories
-python reddot_crawler.py discover
-python reddot_crawler.py fetch
-```
+已实现采集与本地浏览闭环；AI 检索、自动翻译、知识迁移和设计启发 Agent 属于后续计划。项目进展见 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
 
-2026-11-07 保存的官网分类快照有 34 个筛选项：31 个主题大类，以及 Concept、Next Gen Award、Ready For Market 三个阶段筛选。脚本按主题建目录，将阶段单独保存到 metadata.json，不当作主题大类重复采集。运行时读取实时分类树，category_manifest.json 记录当次大类数量及列表，空类别建立目录但不请求详情。
+## 快速开始
 
-目录：data/2026/Concept Design/大类名称/细分类名称/作品名称-ID/{metadata.json, README.md, image/}。细分类来自官网 category 字段竖线前的文字；竖线后的项目阶段单独保存。同一作品属于不同主题时，在对应主题目录分别归档。
-
-默认不限数量，跳过当前目录图片完整的作品，失败图片下次重试。--refresh 强制更新；--limit 3 表示每个大类最多考虑前三件（含跳过）。只跑建筑大类：python reddot_crawler.py fetch --category /12/13/。可用 --detail-category 指定细分类，默认不筛选。
-
-index.json/index.csv 汇总新层级中所有本地作品，包含 archive_path；CSV 占用时改存 index.latest.csv。旧 works 样本不移动、不删除、不计入汇总。每类 discovery-*.json 为列表快照；last_errors.json 为最近处理类别的失败，category_errors.json 汇总全分类运行失败的类别。
-
-模板 templates/work.md 控制作品档案格式。不生成 notes.md、source.html。图片保存于 image/，下载状态记录于 metadata.json。简介来自 meta description，可能短于正文。运行时检查 robots.txt，默认请求间隔三秒；403/429 停止。官网结构变化时需调整解析器。
-
-所有新输出（分类快照、作品目录和汇总索引）均位于 data/2026/Concept Design/。旧目录不会自动迁移；如需复用已采集作品，请将旧的大类文件夹移动到 Concept Design 内，再启动采集。
-
-
-## 多年份
-
-只采集 2025：python reddot_crawler.py fetch --year 2025
-只采集 2026：python reddot_crawler.py fetch --year 2026
-依次采集两年：python reddot_crawler.py fetch --years 2025 2026
---years 优先于 --year，省略年份参数仍默认为 2026。
-数据分别写入 data/2025/Concept Design/ 与 data/2026/Concept Design/，分类目录每年独立读取官网结果。
-同一运行复用网络连接与 robots 规则，SSL/连接中断和超时有限重试三次；分类网络失败记入 category_errors.json 并继续其他类别，结束时报告失败。证书校验保持启用。
-
-## 按奖项运行
-
-Red Dot（已验证的入口）：
-```powershell
-python reddot_crawler.py fetch --years 2025 2026
-```
-
-iF Student Award（实验入口，尚未完成在线验证）：
-```powershell
-python if_crawler.py discover
-python if_crawler.py fetch --limit 3
-```
-
-iF 官网本次直接请求返回 The request is blocked。此入口仅提供 HTML 候选链接发现和待核验档案，不保证分页完整、年份或获奖身份，不作为生产采集器。遇到封锁或没有详情链接将停止；不要绕过验证。需在可正常打开官网的环境检查列表加载请求后，补齐接口、筛选和详情解析。yearId=0 的含义尚未核实，不等同于 2025 或 2026。iF 数据暂存 data/IF Student Award/Unverified/，不混入 Red Dot 档案。
-
-## 统一 main 入口
-
-main.py 提供 RedDotCrawler、IFStudentCrawler 两个独立类，以及 run_reddot()、run_if() 两个函数。实例化或导入不会采集，只有调用 run/main 才执行。
-
-```powershell
-python main.py reddot fetch --years 2025 2026
-python main.py if discover
-python main.py if fetch --limit 3
-```
-
-iF 仍为待在线验证的实验实现，封装调整不代表其分页和全量采集已验证。原 reddot_crawler.py / if_crawler.py 直接运行方式仍有效。
-
-## iF 浏览器模式（2026-11-08）
-
-旧的 iF requests 访问层已替换为 Playwright 可见 Chromium，读取渲染后的 DOM，外部图片域名单独检查 robots。保持 TLS 校验，不使用 stealth，不自动处理验证码；403 或无法核实访问规则时停止。依赖首次安装：
+建议 Python 3.10+，在项目目录运行：
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m playwright install chromium
-python main.py if fetch --year 2026 --limit 1 --project-url "https://ifdesign.com/en/winner-ranking/project/zito/785101"
+python library_server.py
 ```
 
-运行时会弹出独立浏览器，结束后关闭；不是接管你现有的 Chrome 登录窗口。结果在 data/IF/2026/大类/作品ID/，包含 image、metadata.json、README.md。默认单件试采。完整90件的动态分页仍未实现验证，不应使用 --limit 0 就宣称抓全。2025/2026 年份通过详情徽标核验；列表 yearId=0 不应用于推断任意年份。
+访问 http://127.0.0.1:8765 。不需要数据库或云端服务器，作品只在本机读取。界面采用黑白配色、图片保留原色，支持分类树、关键词搜索、来源/年份/奖项筛选、卡片详情和图片画廊。
 
-Red Dot 使用 requests 请求列表 JSON 和详情 HTML，不执行 JavaScript；iF 使用真实浏览器执行 JavaScript，再读取 DOM，速度更慢、内存占用更高，但适合动态页面。浏览器模式不保证消除403。当前仅做语法和命令参数检查，尚未端到端采集验证。
+Windows 可通过 `open_designspark.pyw` 后台启动并打开浏览器，需要已安装 Python 并关联 .pyw；桌面快捷方式应使用本机 pythonw.exe 和该脚本路径。快捷方式不适合直接跨电脑复制。
 
-## 无需下载 Chromium
+## 采集命令
 
-iF 现默认 --browser msedge，使用本机已安装 Edge；也可 --browser chrome。只需安装 Python playwright 包，不必执行 playwright install chromium。只有 --browser chromium 需要下载 Playwright 浏览器。它使用独立浏览器会话，不读取日常浏览器登录资料，不保证消除官网403。
+```powershell
+python main.py reddot categories --year 2025
+python main.py reddot fetch --year 2025 --category "Home Furniture" --limit 3
+python main.py reddot fetch --year 2025 --category "Home Furniture" --award "Red Dot"
+python main.py if fetch --year 2025 --award student
+python main.py if fetch --year 2026 --award best
+```
 
-## iF 2026 全量（最新）
+- 红点：直接请求官网列表和详情，实时解析全部类别目录及名称，不依赖旧 data 识别类别。曾观察到 31 个主题大类，以实际返回为准；排除三个项目阶段。支持大类、细类、官方奖项精确匹配，每年跨类别数量上限。奖项过滤发生在列表取得后。
+- iF：Playwright 浏览器采集，默认已安装的 Edge；使用 Chromium 时先运行 `python -m playwright install chromium`。支持年份及普通学生奖/Best of the Year。兼容 `--category 03`，但在打开详情后筛选，无法避免访问其他作品。
+- 年份：当前年及前两年，2026 年对应 2024—2026。官网没有独立年份选项时明确停止；参数支持不等于全部年份已线上验收。
+- 增量：复用完整图片、补采缺图；`--refresh` 刷新内容与图片。卡片 `<!-- user-notes -->` 后的笔记保留。支持重跑复用，不等于网络分页断点恢复。
+- 保留证书和 robots 检查，不自动处理验证码；访问限制、分页停滞或改版需要排查。
 
-python main.py if fetch --year 2026
+## 数据与目录
 
-默认不限数量，使用本机 Edge，滚动 #resultList 自动加载直到收齐官网总数，默认核对90件。--limit 1 仅试采一件（全年度报告会标为未完成），--refresh 强制更新已完整作品。每件校验详情年份与类别。完整的本地作品会跳过；失败作品记入 errors.json，run_report.json 列出 missing_or_incomplete，仅全部有资料和图片时 complete 才为 true。index.json 汇总所有本地档案。
+```text
+data/
+├── RedDot-Design Concept/年份/大类/细分类/Smile Chair-RedDot/
+│   ├── image/
+│   └── 卡片.md
+└── IF/年份/类别/作品名-编号-student或best/
+    ├── image/
+    └── 卡片.md
+```
 
-输出 data/IF/2026/大类/作品名-ID/{image/,metadata.json,README.md}。动态分页已通过浏览器观察验证18到36件的增长；完整90件的端到端下载尚未运行。旧文档中“只支持候选/默认单件”的说明由本节替代。
+红点作品名保留大小写，不含编号，普通奖后缀 RedDot，其他奖项保留官方名称。内部编号仍用于识别；同名不同作品提示冲突，避免覆盖。卡片以 JSON 格式的 YAML frontmatter 保存结构化信息，正文链接本地图片。分类索引、作品索引和任务报告保存在对应目录。
 
-## iF 下载稳定性修复
+网页兼容旧 metadata.json/README.md，默认扫描 data 和 fresh-*，同来源、年份、编号的副本展示合并。新增作品后点击刷新。旧目录不会自动搬迁。
 
-作品网页仍由 Playwright 加载；公开图片资产改用流式 HTTP 下载，避免 Playwright APIRequestContext 等待完整大图超过60秒。下载前检查资产域名规则，401/403/429停止，不绕过访问限制。
+```powershell
+python library_server.py --root "D:\我的作品库" --port 8766
+python -m unittest discover -s tests -v
+```
 
-默认图片读超时120秒（指无数据传输的等待时间），失败重试3次，可通过 --image-timeout 180 --image-retries 3 调整。每件作品在下载前立即生成 metadata.json 和 README.md；每张图片完成后更新，失败不丢整件资料。图片临时写入.part，通过长度和Pillow图片校验后才改为正式文件。未成功图片会记录 download_failed，后续重跑补齐，已有图片尽量复用。
+## 文件职责
 
-建议先 python main.py if fetch --year 2026 --limit 3 验证，再移除 --limit 采集全年度。仅更新代码、未启动全量爬取。本地模拟超时重试和保存检查已通过。
+| 文件 | 用途 |
+|---|---|
+| main.py | 两个采集器统一入口 |
+| reddot_crawler.py / if_crawler.py | 官网采集 |
+| archive_store.py | 卡片、图片校验和索引 |
+| library_server.py / library_web/ | 本地只读网页 |
+| open_designspark.pyw / designspark.ico | Windows 启动脚本与图标 |
+| tests/ | 离线回归测试 |
 
-## iF 2025 和 2026（最新）
+网页目前只读，搜索是关键词匹配，不是 AI 语义搜索。官网全量覆盖需逐年逐奖项验证；简介主要来自 meta description，可能短于官网正文。旧数据缺少奖项时保持未标注，不猜测为普通奖。
 
-python main.py if fetch --year 2025
-python main.py if fetch --year 2026
-
-脚本从官网读取对应 Award year 的真实链接后导航，按所选年份读取总数，详情继续核验获奖年份。2026-11-08 浏览器核实：2025筛选yearId=1，100 Projects；2026筛选yearId=0，90 Projects。总数默认不写死；如需显式核对，可传 --expected-count 100（2025）或90（2026）。
-
-2025输出在 data/IF/2025/大类/作品名-ID/，2026在对应2026目录。--refresh重新提取并下载，省略则补齐未完成作品。此次只修改并本地检查，没有启动全年采集。
+仓库不包含作品数据、图片、日志或凭证。获奖作品版权属于权利人，公开完整图片与原文需另核实授权。本项目尚未额外授予代码开源许可证。

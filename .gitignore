@@ -1,4 +1,6 @@
 data/
+fresh-*/
+*.lnk
 work/
 .venv/
 venv/

@@ -4,13 +4,29 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qsl
+from urllib.parse import urljoin, urlparse
 
+from archive_store import RECENT_YEARS, read_card, write_card, valid_image, rebuild_index, resolve_folder
 from bs4 import BeautifulSoup
 from reddot_crawler import save, safe_name
 
 BASE = 'https://ifdesign.com'
+VERSION = '1.1.0'
+
 START = BASE + '/en/social-engagement/student-award/winner-overview/?awardId=1&find=&sort=desc&yearId=0'
+
+
+def category_matches(category, filters):
+    if not filters:
+        return True
+    actual = (category or '').strip().casefold()
+    for value in filters:
+        value = value.strip().casefold()
+        if value.isdigit() and actual[:2] == f'{int(value):02d}':
+            return True
+        if value == actual:
+            return True
+    return False
 
 
 def labelled_value(soup, labels):
@@ -56,16 +72,9 @@ def parse_project(html, args):
 
 
 def write_record(folder, record):
-    record['images_complete'] = bool(record['images']) and all(
-        i.get('status') == 'downloaded' and i.get('local_path') and
-        (folder / i['local_path']).is_file() for i in record['images'])
-    save(folder / 'metadata.json', record)
-    pictures = '\n\n'.join(f"![{record['title']}]({i['local_path']})" if i.get('local_path')
-        else f"- 图片尚未下载：{i['status']}" for i in record['images'])
-    (folder / 'README.md').write_text(
-        f"# {record['title']}\n\n- 年份：{record['award_year']}\n- 大类：{record['category']}\n"
-        f"- 来源：{record['source_url']}\n\n## 官方简介\n\n{record['description'] or '未提供'}"
-        f"\n\n## 作品图片\n\n{pictures}\n", encoding='utf-8')
+    record['source'] = 'IF'
+    record['award_level'] = record.get('selection_award', 'unverified')
+    write_card(folder, record)
 
 
 def download_image(client, url, folder, number, attempts, read_timeout):
@@ -213,42 +222,86 @@ class IFClient:
             self.page.locator('h1').wait_for()
             self.page.locator('img[src*="/user-uploads/"]').first.wait_for(state='attached')
         else:
-            self.page.locator('a[href*="/winner-ranking/project/"]').first.wait_for()
+            self.page.get_by_text(re.compile(r'^\d+ Projects$')).first.wait_for(state='attached')
         return SimpleNamespace(text=self.page.content())
 
 
-def fetch(args):
-    client = IFClient(args.delay, args.browser)
+def filter_option(page, label):
+    """Exclude the identically named removal chip by requiring a radio child."""
+    radio = page.get_by_role('radio', name=label, exact=True)
+    return page.locator('a').filter(has=radio).first
+
+
+def require_selected_filter(page, label):
+    from playwright.sync_api import expect
+    radio = filter_option(page, label).get_by_role('radio', name=label, exact=True)
     try:
-        return collect(args, client)
+        expect(radio).to_be_checked(timeout=60000)
+    except AssertionError as exc:
+        raise RuntimeError(f'Filter not selected: {label}; actual URL: {page.url}') from exc
+
+
+def select_list_filter(client, label):
+    page = client.page
+    option = filter_option(page, label)
+    try:
+        option.wait_for(state='attached')
+    except Exception as exc:
+        raise RuntimeError(f'Official filter unavailable or not published: {label}; URL: {page.url}') from exc
+    radio = option.get_by_role('radio', name=label, exact=True)
+    if not radio.is_checked():
+        href = option.get_attribute('href')
+        if not href:
+            raise RuntimeError(f'Missing official filter link: {label}')
+        target = urljoin(page.url, href)
+        if urlparse(target).scheme != 'https' or urlparse(target).hostname != 'ifdesign.com':
+            raise RuntimeError(f'Unexpected filter URL: {target}')
+        client.get(target)
+    require_selected_filter(page, label)
+
+
+def fetch(args):
+    out = Path(args.output).resolve() / 'IF' / str(args.year)
+    report = {'year':args.year, 'award':args.award, 'state':'running', 'complete':False}
+    destination = out / '_index' / ('task-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f') + '.json')
+    save(destination, report)
+    client = None
+    try:
+        client = IFClient(args.delay, args.browser)
+        result = collect(args, client)
+        report.update(state='finished', complete=not bool(args.limit), limited=bool(args.limit))
+        return result
+    except BaseException as exc:
+        report.update(state='interrupted' if isinstance(exc,KeyboardInterrupt) else 'failed', error=str(exc))
+        raise
     finally:
-        client.close()
+        save(destination, report)
+        rebuild_index(out)
+        if client is not None: client.close()
 
 
 def collect(args, client):
     out = Path(args.output).resolve() / 'IF' / str(args.year)
+    print('Incremental collection 1.1.0:', out, flush=True)
+    current_records = {}
     projects = set(args.project_url or [])
     expected = None
     if not projects:
-        if args.year not in (2025, 2026):
-            raise RuntimeError('Supported list years: 2025, 2026')
+        if args.year not in RECENT_YEARS:
+            raise RuntimeError(f'Supported list years: {RECENT_YEARS}')
         client.get(args.url)
         page = client.page
-        year_link = page.get_by_role('link', name=f'Award year {args.year}', exact=True).first
-        year_link.wait_for(state='attached')
-        href = year_link.get_attribute('href')
-        if not href:
-            raise RuntimeError('Missing official year filter link')
-        selected_url = urljoin(page.url, href)
-        if urlparse(selected_url).hostname != 'ifdesign.com':
-            raise RuntimeError('Unexpected year filter host')
-        # Follow the live official filter, not a guessed yearId mapping.
-        client.get(selected_url)
-        selected_query = dict(parse_qsl(urlparse(page.url).query))
-        target_query = dict(parse_qsl(urlparse(selected_url).query))
-        if selected_query.get('yearId') != target_query.get('yearId'):
-            raise RuntimeError('Year filter navigation did not match target')
-        page.get_by_role('link', name=f'Award year {args.year}', exact=True).first.wait_for(state='attached')
+        year_label = f'Award year {args.year}'
+        select_list_filter(client, year_label)
+        award_label = {'student': 'iF DESIGN STUDENT AWARD',
+                       'best': 'iF DESIGN STUDENT AWARD Best of the Year'}[args.award]
+        select_list_filter(client, award_label)
+        # Verify both rendered selections after navigation; selected filter chips
+        # have removal URLs, so neither their href nor URL equality proves selection.
+        require_selected_filter(page, year_label)
+        require_selected_filter(page, award_label)
+        selected_url = page.url
+        print(f'Filters confirmed: {year_label}; {award_label}', flush=True)
         counter = page.get_by_text(re.compile(r'^\d+ Projects$')).first
         counter.wait_for(state='attached')
         expected = int(re.search(r'\d+', counter.inner_text()).group())
@@ -258,7 +311,7 @@ def collect(args, client):
         while True:
             for href in links.evaluate_all('(nodes) => nodes.map(n => n.href)'):
                 projects.add(href.split('#')[0])
-            save(out / 'discovery.json', {'source': selected_url, 'year': args.year, 'expected': expected,
+            save(out / 'discovery.json', {'source': selected_url, 'year': args.year, 'award': args.award, 'categories': args.category, 'expected': expected,
                                          'projects': sorted(projects), 'complete': len(projects) == expected})
             print(f'Discovery: {len(projects)}/{expected}', flush=True)
             if len(projects) >= expected:
@@ -273,55 +326,56 @@ def collect(args, client):
                 raise RuntimeError(f'Pagination stalled at {len(projects)}/{expected}; discovery saved, rerun later') from exc
         if len(projects) != expected:
             raise RuntimeError('Unique URL count differs from official total')
+    if not projects and expected == 0:
+        print('Official selected scope contains 0 projects')
+        return
     if not projects:
         raise RuntimeError('No project links found. Site may require JavaScript; pagination/API must be inspected. No archive reported as complete.')
     if args.command == 'discover':
         return
     failures = []
-    selected = sorted(projects)[:args.limit or None]
+    selected = sorted(projects)
+    matched, excluded = set(), set()
+    stopped_by_limit = False
     for position, url in enumerate(selected, 1):
         print(f'Work {position}/{len(selected)}: {url}', flush=True)
         try:
-            existing = next((p for p in out.glob('*/*/metadata.json')
-                             if json.loads(p.read_text(encoding='utf-8')).get('source_url') == url), None)
-            if existing and not args.refresh:
-                old = json.loads(existing.read_text(encoding='utf-8'))
-                if old.get('year_verified') and old.get('category') and old.get('images_complete') and (existing.parent / 'README.md').exists() and all(
-                    i.get('local_path') and (existing.parent / i['local_path']).is_file() and
-                    (existing.parent / i['local_path']).stat().st_size > 0 for i in old.get('images', [])):
-                    print('Skip complete:', url, flush=True)
-                    continue
             record = parse_project(client.get(url).text, args)
-            if not record['year_verified'] or not record['category']:
+            if not record['image_urls']:
+                raise ValueError('No official project images found')
+            if not record['year_verified']:
                 raise ValueError('Missing verified year or category: ' + url)
+            if not category_matches(record['category'], args.category):
+                excluded.add(url)
+                print('Category excluded:', record['category'], flush=True)
+                continue
+            matched.add(url)
+            record['selection_award'] = args.award if expected is not None else 'unverified'
+            record['selection_source'] = selected_url if expected is not None else None
             record['source_url'] = url
             title = record['title']
             url_parts = urlparse(url).path.rstrip('/').split('/')
             project_id = url_parts[-1]
             project_name = url_parts[-2] if len(url_parts) > 1 else title
             record['source_id'] = project_id
-            parent = out / safe_name(record['category'] or '待核验分类')
-            folder = parent / safe_name(f'{project_name}-{project_id}')
-            legacy = parent / safe_name(project_id)
-            if legacy.is_dir() and not folder.exists():
-                legacy.rename(folder)
+            parent = out / safe_name(record['category'] or '待分类')
+            suffix = '-' + record['selection_award']
+            folder = parent / safe_name(f'{project_name}-{project_id}{suffix}')
+            folder = resolve_folder(out, folder, project_id)
+            old = read_card(folder)
+            if expected is None:
+                print('Single project: award level unverified; use list filters to verify', flush=True)
             (folder / 'image').mkdir(parents=True, exist_ok=True)
-            previous = json.loads((folder / 'metadata.json').read_text(encoding='utf-8')) if (folder / 'metadata.json').exists() else {}
-            old_images = {i['url']: i for i in previous.get('images', [])}
             record['images'] = [dict(url=u, status='pending', local_path=None) for u in record['image_urls']]
+            record['archive_path'] = folder.relative_to(out).as_posix()
+            current_records[url] = record
             write_record(folder, record)  # Save the template BEFORE any network image transfer.
             for i, image_url in enumerate(record['image_urls'], 1):
-                old_image = old_images.get(image_url)
-                if not args.refresh and old_image and old_image.get('local_path') and (folder / old_image['local_path']).is_file():
-                    from PIL import Image
-                    try:
-                        with Image.open(folder / old_image['local_path']) as image:
-                            image.verify()
-                        record['images'][i-1] = old_image
-                        write_record(folder, record)
-                        continue
-                    except (OSError, ValueError):
-                        pass
+                previous = next((item for item in (old or {}).get('images', []) if item['url'] == image_url and valid_image(folder, item)), None)
+                if previous and not args.refresh:
+                    record['images'][i-1] = previous
+                    write_record(folder, record)
+                    continue
                 try:
                     item = download_image(client, image_url, folder, i, args.image_retries, args.image_timeout)
                 except RuntimeError as exc:
@@ -332,34 +386,39 @@ def collect(args, client):
                 write_record(folder, record)
             print('Saved candidate:', title)
             print('Images:', sum(i['status'] == 'downloaded' for i in record['images']), '/', len(record['images']))
+            if args.limit and len(matched) >= args.limit:
+                stopped_by_limit = True
+                break
         except Exception as exc:
             failures.append({'url': url, 'error': str(exc)})
             save(out / 'errors.json', failures)
             print('Failed:', url, str(exc), flush=True)
             if isinstance(exc, RuntimeError) and ('403' in str(exc) or '429' in str(exc)):
                 raise
-    records = [dict(json.loads(p.read_text(encoding='utf-8')), archive_path=p.parent.relative_to(out).as_posix())
-               for p in out.glob('*/*/metadata.json')]
-    save(out / 'index.json', records)
+    records = list(current_records.values())
+    rebuild_index(out)
     save(out / 'errors.json', failures)
     complete_urls = {r['source_url'] for r in records if r.get('images_complete') and r.get('year_verified')}
-    missing = sorted(projects - complete_urls)
-    save(out / 'run_report.json', {'year': args.year, 'expected': expected,
-         'discovered': len(projects), 'missing_or_incomplete': missing, 'errors': failures,
-         'complete': not missing and not failures and (expected is None or len(projects) == expected)})
+    missing = sorted(matched - complete_urls)
+    save(out / 'run_report.json', {'year': args.year, 'award': args.award, 'categories': args.category, 'expected': expected,
+         'version': VERSION, 'fresh_collection': False, 'limited': stopped_by_limit,
+         'matched': len(matched), 'excluded': len(excluded), 'discovered': len(projects), 'missing_or_incomplete': missing, 'errors': failures,
+         'complete': not stopped_by_limit and not missing and not failures and (expected is None or len(projects) == expected)})
     if missing or failures:
         raise SystemExit(f'Not complete: {len(missing)} missing/incomplete; see run_report.json')
-    print(f'Completed: {len(projects)} works, including images.')
+    print(f'Completed selected scope: {len(matched)} matched works; {len(excluded)} excluded; limited={stopped_by_limit}.')
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['discover', 'fetch'])
     parser.add_argument('--url', default=START)
-    parser.add_argument('--year', type=int, default=2026)
+    parser.add_argument('--year', type=int, choices=RECENT_YEARS, default=max(RECENT_YEARS))
+    parser.add_argument('--award', choices=['student', 'best'], default='student', help='Official Student Award or Best of the Year filter')
+    parser.add_argument('--category', nargs='+', default=[], help='SDG numbers 01..17 or exact category names; multiple values use OR')
     parser.add_argument('--image-timeout', type=int, default=120, help='Read inactivity timeout in seconds')
     parser.add_argument('--image-retries', type=int, default=3)
-    parser.add_argument('--refresh', action='store_true')
+    parser.add_argument('--refresh', action='store_true', help='Refresh official content and redownload images; user notes are preserved')
     parser.add_argument('--expected-count', type=int, default=0, help='Optional expected total; default reads selected year total from page')
     parser.add_argument('--browser', choices=['msedge', 'chrome', 'chromium'], default='msedge',
                         help='Default: installed Edge; only chromium requires playwright browser download')
